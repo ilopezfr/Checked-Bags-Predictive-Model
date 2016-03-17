@@ -1,0 +1,361 @@
+#####################################        
+####   PREDICT ABPR USING H2O     ###
+####    2014-2015 & ALL FLIGHTS   ###
+#### k-Means / PCA / GLRM /  GBM  ###
+#####################################        
+
+rm(list=ls(all=TRUE))  # Clean up the memory of R session
+setwd("~/Desktop/...")  #set working directory  #MAC
+raw_data = read.table('Raw data for forecast-bagsv1.txt', header = TRUE, sep="\t", fileEncoding = "UCS-2LE")
+head(raw_data)
+names(raw_data)
+
+## Create DateTime variables:
+#library(chron)
+raw_data$DT_lcl= strptime(raw_data$SCH_DPRT_DTML, format= '%m/%d/%Y %I:%M:%S %p') #Format 10/7/2014 3:23:00 PM
+tail(raw_data$DT_lcl) # Format 2014-10-07 15:23:00 CDT
+
+#Create DT_Year (as factor: "14", "15")
+raw_data$DT_Year <- as.factor(format(as.Date(raw_data$DT_lcl), "%y")) ; str(raw_data$DT_Year)
+#Create DT_Month (as factor)
+DTM <- as.numeric(format(as.Date(raw_data$DT_lcl), "%m")) ; str(DTM)
+raw_data$DT_Month <- as.factor(DTM) ; str(raw_data$DT_Month)
+
+#Create DT_Season:
+attach(raw_data)
+raw_data$DT_Season[DTM==3 | DTM==4 | DTM==5] <- 1 #Spring 
+raw_data$DT_Season[DTM==6 | DTM==7 | DTM==8] <- 2 #Summer 
+raw_data$DT_Season[DTM==9 | DTM==10 | DTM==11] <- 3 #Fall 
+raw_data$DT_Season[DTM==12 | DTM==1 | DTM==2] <- 4 ; #Winter
+raw_data$DT_Season <- as.factor(raw_data$DT_Season); str(raw_data$DT_Season)  
+
+#Create DT_Week (WEEK of the year, as factor) 
+raw_data$DT_Week <- as.factor(as.numeric(format(as.Date(DT_lcl), "%U"))+1); str(raw_data$DT_Week)  
+#Create DT_Day (DAY of the month, as factor) 
+raw_data$DT_Day <- as.factor(as.numeric(format(as.Date(DT_lcl), "%d"))); str(raw_data$DT_Day)
+#Create DT_DayOfTheWeek (DAY of the WEEK, as factor: 0=Sunday,... 6=Saturday) 
+raw_data$DT_DayOfTheWeek <- as.factor(as.numeric(format(as.Date(DT_lcl), "%w"))) ;str(raw_data$DT_DayOfTheWeek)
+#Create DT_Workingday (Assigns 1 to weekday, 0 to weekend) 
+raw_data$DT_Workingday <- as.factor(ifelse(raw_data$DT_DayOfTheWeek == "0" |raw_data$DT_DayOfTheWeek == "6" , 0, 1)); str(raw_data$DT_Workingday)
+#Create DT_Hour (HOUR of the day (0-23))
+raw_data$DT_Hour <- as.numeric(format(strptime(DT_lcl, "%Y-%m-%d %H:%M:%S"), "%H"))
+#Create DT_DaySegment (Morning 00:00-12:00, Afternoon 12:00-18:00, Evening 18:00-00:00) attach(data.model1)
+raw_data$DT_DaySegment[raw_data$DT_Hour >= 0 & raw_data$DT_Hour <12 ] <- 1 #Morning
+raw_data$DT_DaySegment[raw_data$DT_Hour >= 12 & raw_data$DT_Hour <18 ] <- 2 #Afternoon
+raw_data$DT_DaySegment[raw_data$DT_Hour >= 18] <- 3 #Evening detach(data.model1)
+raw_data$DT_DaySegment <- as.factor(raw_data$DT_DaySegment); str(raw_data$DT_DaySegment)
+raw_data$DT_Hour <- as.factor(raw_data$DT_Hour); str(raw_data$DT_Hour)
+
+#Create HUB_ARRV variable
+hubs <- c("ORD", "EWR", "GUB", "DEN", "SFO", "IAH", "NRT", "IAD" , "LAX") 
+raw_data$HUB_ARRV <- as.factor(ifelse(raw_data$ARR_STN %in% hubs, 1, 0))
+raw_data$HUB_DEPT <- as.factor(ifelse(raw_data$DEPT_STN %in% hubs, 1, 0))
+
+#Create DPRTARRV_CD variable
+raw_data$DPRTARRV_CD <- interaction(raw_data[c("DEPT_STN", "ARR_STN")], drop=TRUE, sep = ""); str(raw_data$DPRTARRV_CD)
+
+#Create Pax Ratios
+raw_data$KidsToPax  <-   raw_data$CNT_KID/raw_data$CNT_PAX_FNL
+raw_data$FBToPax <- raw_data$F_pax_rev/raw_data$CNT_PAX_FNL
+raw_data$EcoToPax <- raw_data$Y_pax_rev/raw_data$CNT_PAX_FNL
+raw_data$LapchldToPax <- raw_data$CNT_LAP_CHLD/raw_data$CNT_PAX_FNL
+raw_data$BagsLclToPax <- raw_data$CNT_BAG_CHK_LCL/raw_data$CNT_PAX_FNL
+raw_data$BagsTransToPax <- raw_data$CNT_BAG_CHK_TRANS/raw_data$CNT_PAX_FNL
+
+str(raw_data)
+
+#Create unique Identifier: FLIGHT_ID 
+raw_data$FLIGHT_ID <- with(raw_data, paste0(DT_Year, DT_Month, DT_Month,DEPT_STN,ARR_STN,FLT_NUM )) 
+#raw_data$FLIGHT_ID <- interaction(raw_data[c("DT_Year", "DT_Month", "DT_Day",
+#                                             "DEPT_STN", "ARR_STN", "FLT_NUM")], drop=TRUE); str(raw_data$FLIGHT_ID )
+
+
+# Create lag_ABPR variable
+#install.packages("data.table")
+library(data.table);
+raw_data1 = raw_data
+raw_data1$flight_nbr2 <- with(raw_data1, paste0(DEPT_STN,ARR_STN,FLT_NUM))
+
+raw_data1.t <- data.table(raw_data1)  #do I need this step?
+lg <- function(x)c(NA, x[1:(length(x)-1)])
+raw_data1.t[,lag_ABPR := lg(ABPR), by = c("flight_nbr2")]
+
+raw_data1.t$lag_ABPR[is.na(raw_data1.t$lag_ABPR)] <- with(raw_data1.t, ave(ABPR, DPRTARRV_CD, 
+                                            FUN = function(x) mean(x, na.rm = TRUE))
+                                            )[is.na(raw_data1.t$lag_ABPR)]
+raw_data = data.frame(raw_data1.t); names(raw_data)
+
+write.csv(raw_data, file="raw_data_full.csv", row.names=FALSE)  #SAVE final file fo the analysis
+#raw_data <- read.csv('raw_data_full.csv', header=T);   #LOAD file
+
+##### OUTLIERS  #####
+raw_data_tmp = raw_data
+names(raw_data_tmp)
+#1. Remove flights with ABPR > 3
+out = subset(raw_data_tmp, ABPR > 3,select = c(FLIGHT_ID, ABPR), sort=descendent); nrow(out) #76 (>3); 172 (>2.5); 871 (>2)
+out[order(out$ABPR), ]; #visualize those outliers
+raw_data_tmp = subset(raw_data_tmp, ABPR <3)  #remove 76 outliers with ABPR >3
+
+#2. Consider as outliers and remove those flights with discrepancies in count of bags. 
+#Rule: CNT_BAG_CHK / CNT_BAG_FNL > 2
+discrep = subset(raw_data_tmp, CNT_BAG_CHK / CNT_BAG_FNL >= 2, 
+                 select=c(FLIGHT_ID, CNT_BAG_FNL, CNT_BAG_CHK, CNT_PAX_FNL, ABPR)); 
+head(discrep); nrow(discrep) #3029 obs
+index <- raw_data_tmp$FLIGHT_ID %in% discrep$FLIGHT_ID; table(index) 
+raw_data_tmp <- raw_data_tmp[!index, ]
+
+#3. Removed markets with less than 10 flights between 2014 and 2015
+#subset(raw_data_tmp, DPRTARRV_CD == 'TULORD' , select=c(FLIGHT_ID,DEPT_STN, ARR_STN)) 
+markets <- table(raw_data_tmp$DPRTARRV_CD)
+sm.markets <-  names(markets[markets < 10])
+index <- raw_data_tmp$DPRTARRV_CD %in% sm.markets; table(index)  #616 flights
+raw_data_tmp <- raw_data_tmp[!index, ]
+
+#4. Removed UA Extra Sections (XP) flight: flight_nbr = [2050, 2119] 
+raw_data_tmp = raw_data_tmp[!(raw_data_tmp$FLT_NUM >= 2050 & raw_data_tmp$FLT_NUM <= 2119),]   #2884 flights removed
+
+###### NA's ########
+sum(is.na(data.model.merged$SCH_MILES)) #We have 3 that correspond to the miles between ORD-JFK (doesn't exist on data.miles) [Removed]
+#subset(data.model.merged, is.na(data.model.merged$SCH_MILES))
+#data.model.merged <- completeFun(data.model.merged, "SCH_MILES") #Remove them using completeFun function
+#completeFun <- function(data, desiredCols) {
+#  completeVec <- complete.cases(data[,desiredCols])
+#  return(data[completeVec,])
+# }
+#Now we should have 132484 obs, 34 var
+
+write.csv(raw_data_tmp, file="raw_data_full.clean.csv", row.names=FALSE) #SAVE file
+dmm = raw_data_tmp
+
+##################
+#### MODELING ####
+##################
+rm(list=ls(all=TRUE))  # Clean up the memory of R session
+setwd("~/Desktop/United - Predict Checked Bags Project/")  #set working directory  #MAC
+#setwd("C:/Users/u339823/Desktop/United - Predict Checked Bags Project")   #PC
+model_data <- read.csv('raw_data_full.clean.csv', header=T);   #LOAD file
+dmm = model_data; names(dmm)
+#dmm$DT_Year1 = NULL
+
+dmm$INTL <- factor(dmm$INTL) 
+dmm$HUB_ARRV  <- factor(dmm$HUB_ARRV)
+dmm$DT_Month  <- factor(dmm$DT_Month)
+dmm$DT_Year  <- factor(dmm$DT_Year)
+dmm$DT_Season <- factor(dmm$DT_Season)
+dmm$DT_Week <- factor(dmm$DT_Week)
+dmm$DT_Day <- factor(dmm$DT_Day)
+dmm$DT_DayOfTheWeek <- factor(dmm$DT_DayOfTheWeek)
+dmm$DT_Workingday <- factor(dmm$DT_Workingday)
+str(dmm)
+
+# Select Variables from dataset  # 35 var
+predictors <- c("DEPT_STN", "ARR_STN", 
+                "sch_miles",
+                "DT_Year", "DT_Month", "DT_Season", "DT_Week", "DT_DayOfTheWeek", 
+                "DT_Workingday", "DT_Hour", "DT_DaySegment", 
+                "KidsToPax", "FBToPax", "LapchldToPax", 
+                "NonGen_Mbr", "Sil_mbr", "GldPls_mbr",
+                "NonStop", "Orig_CNX", "CNX_CNX","CNX_Dest",
+                "one_way_ind","LOS_0_1_ind", "LOS_2_3_ind", "LOS_4_9_ind","LOS_10pls_ind", 
+                "AP_0_7_ind", "AP_8_20_ind","AP_21_29_ind","AP_30pls_ind",  
+                "pnr_size1_ind",
+                "short_haul_ind",
+                "no_sat_stay_ind",
+                "outbnd_sun2tue",
+                "LF_rev", "lag_ABPR") 
+predictors_and_Y <- c(predictors, "ABPR")
+
+dmm.s <-  data.frame(subset(dmm, select=predictors_and_Y))   #36 var (predictors + ABPR)
+dmm.sX <- dmm.s[,1:(dim(dmm.s)[2]-1)]  #35
+
+dmm.s_num <-dmm.s[,sapply(dmm.s,is.numeric)] #27 vars Only Numeric
+dmm.sX_num <-dmm.sX[,sapply(dmm.sX,is.numeric)] #26 vars
+
+############################
+###### 1st Method    #######
+######  PCA + GBM    #######
+############################
+
+#1.A PCA: Only applies to numeric variables (no response variable): testing.sX.num
+# using caret. Add arg thresh=0.85 to auto select those first PCs that explain 85% of total variability 
+library(caret)
+trans = preProcess(dmm.sX_num,
+                   method=c("center", #"BoxCox", 
+                            "scale", "pca"), thresh = 0.85) #takes thresh = 0.85 of the PCs 
+pca_components1 = predict(trans, dmm.sX_num) ## from 26 var, reduced to only 16 PCs that explain 85% of variability
+head(pca_components1)
+names(dmm.s_hex)
+
+#1.2 PCA using prcomp
+#pca <- prcomp(dmm.sX_num, center = TRUE, scale.=TRUE, cor=TRUE)  #Find how many components
+#plot(pca, type='l') 
+#summary(pca)   # 85% of the variance is explained with 12 components 
+#pca$rotation
+#pca_components <- data.frame(pca$x[,1:12])
+#head(pca_components)
+#plot(pca, type = "l")
+
+#2 K-MEANS ##  Skip!!
+#2.1 Select number of Clusters "k"
+#2.2 Apply K-Means function
+
+
+#3. PREDICTING
+#Combine ABPR, Categorical variables and 16 PCs 
+#h2o.shutdown()
+library(h2o) #Start h2o
+conn <- h2o.init(max_mem_size='5g')
+names(dmm)
+#pca_c_hex  <-  as.h2o(pca_components1)  #Upload pca_components1_hex
+
+attach(dmm)
+dmm_predict <- data.frame(FLIGHT_ID,                               #22 var
+                      DEPT_STN, ARR_STN, 
+                      DT_Year, DT_Month, #dmm_hex$DT_Season,
+                      DT_Week,DT_DayOfTheWeek, DT_Workingday, 
+                      DT_Hour, #dmm_hex$DT_DaySegment, 
+                      pca_components1,ABPR)
+str(dmm_predict)
+#colnames(dmm_result)[length(dmm_result)-1] <- "clusterID"   #Add clusterID column
+#dmm_result$clusterID <- as.factor(dmm_result$clusterID)   #set clusterID as factor type
+
+# Split data using stratified function
+set.seed(1)  #Split in a way that we have same % of flights per each ARR_STN
+train <- stratified(dmm_predict, "ARR_STN", 0.6)  ##Select 60% flights for each ARR_STN  // TRAINING SET
+test.1 <- dmm_predict[!(dmm_predict$FLIGHT_ID %in% train$FLIGHT_ID), ] 
+test <- stratified(test.1, "ARR_STN", 0.75)  ## (0.4*0.75 =) 30% flights  // TESTING SET
+hold <- test.1[!(test.1$FLIGHT_ID %in% test$FLIGHT_ID), ]   ##  10% flights  // HOLD SET
+
+## GBM - predicting without iterating ####
+# Try using different parameters and stratified function.
+#r <- h2o.runif(result_keep_hex)
+#train <- result_keep_hex[r < 0.6,]
+#test <- result_keep_hex[(r >= 0.6) & (r < 0.9),]
+#hold <- result_keep_hex[r >= 0.9,]
+
+train_hex <- as.h2o(train);
+test_hex <- as.h2o(test);
+hold_hex <- as.h2o(hold);
+response <- "ABPR"
+predictors <- setdiff(names(dmm_predict), c(response,"FLIGHT_ID"))
+
+#
+t1 <- Sys.time()
+gbm2 <- h2o.gbm(x = predictors,
+               y = response, 
+               training_frame = train_hex, 
+               validation_frame = test_hex,
+               ntrees = 1000,
+               max_depth = 8,
+               learn_rate = 0.12,
+               nbins_cat = 100,
+               distribution = "gaussian",
+               #stopping_rounds = 1, 
+               #stopping_tolerance = 0.01, 
+               #stopping_metric = "misclassification", 
+               balance_classes = T) 
+t2 <- Sys.time() 
+t2-t1
+gbm2
+
+#Predict over hold data 
+gbm_pred_hex <- h2o.predict(gbm2, newdata=hold_hex)
+hold_hex$ABPR_predict <- gbm_pred_hex$predict 
+hold_results <- as.data.frame(hold_hex)
+write.csv(hold_results,"PREDICTED_GBM.csv", row.names=FALSE)
+
+plot(hold_results$ABPR_predict, hold_results$ABPR)
+perf_gbm <- h2o.performance(gbm, hold); perf_gbm
+summary(hold)
+
+############################
+######  2nd Method   #######
+###### GLRM + GBM    #######
+############################
+
+library(h2o) #Start h2o
+#h2o.shutdown()
+conn <- h2o.init(max_mem_size='5g')
+
+#1. GLRM
+# Add regulariztions?
+dmm.s_hex <- as.h2o(dmm.s)
+t1 <- Sys.time()
+dmm.glrm <- h2o.glrm(training_frame = dmm.s_hex, cols = 1:36, k = 15, 
+                     transform = "STANDARDIZE", 
+                     loss = "Quadratic", 
+                     regularization_x = "None", 
+                     regularization_y = "None",
+                     #init = "SVD",
+                     max_iterations = 100)
+t2 <- Sys.time() 
+t2-t1
+plot(dmm.glrm)
+
+arch_x_hex <- h2o.getFrame(dmm.glrm@model$representation_name)  # X matrix corresponding to the k=10 archetypes. 
+head(arch_x)
+
+dmm.glrm@model$help$eigenvectors
+
+arch_x <- as.data.frame(arch_x_hex)  #1290254 obs, 10 var
+
+#to reconstruct the original data:
+#dmm.pred <- predict(dmm.glrm, dmm.s.hex)
+#head(gait.pred)
+
+# Build new dataset with Flight_id, archetypes and response var. 
+#attach(dmm)
+dmm_predict <- data.frame(FLIGHT_ID, DPRTARRV_CD, arch_x, ABPR)  # 1290254 obs, 13 var.
+
+# Split data using stratified function
+set.seed(1)  #Split in a way that we have same % of flights per each DPRTARRV_CD
+train <- stratified(dmm_predict, "DPRTARRV_CD", 0.6)  ##Select 60% flights for each DPRTARRV_CD  // TRAINING SET
+test.1 <- dmm_predict[!(dmm_predict$FLIGHT_ID %in% train$FLIGHT_ID), ] 
+test <- stratified(test.1, "DPRTARRV_CD", 0.75)  ## (0.4*0.75 =) 30% flights  // TESTING SET
+hold <- test.1[!(test.1$FLIGHT_ID %in% test$FLIGHT_ID), ]   ##  10% flights  // HOLD SET
+
+## 2. GBM - predicting without iterating ####
+# Try using different parameters and stratified function.
+#r <- h2o.runif(result_keep_hex)
+#train <- result_keep_hex[r < 0.6,]
+#test <- result_keep_hex[(r >= 0.6) & (r < 0.9),]
+#hold <- result_keep_hex[r >= 0.9,]
+
+train_hex <- as.h2o(train);
+test_hex <- as.h2o(test);
+hold_hex <- as.h2o(hold);
+response <- "ABPR"
+predictors <- setdiff(names(dmm_predict), c(response,"FLIGHT_ID", "DPRTARRV_CD"))
+
+#
+t1 <- Sys.time()
+gbm2 <- h2o.gbm(x = predictors,
+               y = response, 
+               training_frame = train_hex, 
+               validation_frame = test_hex,
+               ntrees = 1000,
+               max_depth = 8,
+               learn_rate = 0.1,
+               nbins_cat = 100,
+               distribution = "gaussian",
+               #stopping_rounds = 1, 
+               #stopping_tolerance = 0.01, 
+               #stopping_metric = "misclassification", 
+               balance_classes = F) 
+t2 <- Sys.time() 
+t2-t1
+gbm2
+
+#Predict over hold data 
+gbm_pred_hex <- h2o.predict(gbm2, newdata=hold_hex)
+hold_hex$ABPR_predict <- gbm_pred_hex$predict 
+hold_results <- as.data.frame(hold_hex)
+write.csv(hold_results,"PREDICTED_GBM.csv", row.names=FALSE)
+
+perf_gbm <- h2o.performance(gbm2, hold); perf_gbm
+summary(hold)
+
+
+
+
+
